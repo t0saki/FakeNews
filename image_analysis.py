@@ -834,7 +834,7 @@ def visualize_clustering(embedding, results_with_features, n_clusters, output_di
             if overall_prop > 0:
                 normalized_ratio = cluster_prop / overall_prop
                 normalized_proportions_str.append(
-                    f"{label}: {normalized_ratio:.1f}x")
+                    f"{label}: {normalized_ratio:.3f}x")
             else:
                 normalized_proportions_str.append(f"{label}: inf") # Or some indicator
         proportion_title_part = " (Normalized: " + ", ".join(normalized_proportions_str) + ")"
