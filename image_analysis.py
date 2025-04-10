@@ -31,13 +31,23 @@ from tqdm import tqdm
 import pandas as pd
 from concurrent.futures import ProcessPoolExecutor
 
-from data_loader import PostDataLoader
+from data_loader import PostDataLoader, DirectoryDataLoader
 
 # --- Configuration ---
-POSTS_FILE_PATH = ['data/twitter_dataset/devset/posts.txt', 'data/twitter_dataset/testset/posts_groundtruth.txt'] # Add more paths here if needed
-IMAGES_DIR_PATH = ['data/twitter_dataset/devset/images', 'data/twitter_dataset/testset/images'] # Add corresponding image dirs here
-OUTPUT_DIR_BASE = 'analysis_output'  # Directory to save plots
-RESULTS_CACHE_DIR = 'analysis_cache'  # Directory for cached results
+# POSTS_FILES = ['data/twitter_dataset/devset/posts.txt', 'data/twitter_dataset/testset/posts_groundtruth.txt'] # Add more paths here if needed
+# IMAGES_DIRS = ['data/twitter_dataset/devset/images', 'data/twitter_dataset/testset/images'] # Add corresponding image dirs here
+# DATA_LOADER = PostDataLoader
+# DATA_LOADER_ARGS = [POSTS_FILE, IMAGES_DIRS]
+# OUTPUT_DIR_BASE = 'analysis_output'  # Directory to save plots
+# RESULTS_CACHE_DIR = 'analysis_cache'  # Directory for cached results
+
+RUMOR_DIRS = ['/mnt/d/LFDev-D/weibo_dataset/rumor_images']
+NONRUMOR_DIRS = ['/mnt/d/LFDev-D/weibo_dataset/nonrumor_images']
+DATA_LOADER = DirectoryDataLoader
+DATA_LOADER_ARGS = [RUMOR_DIRS, NONRUMOR_DIRS]
+OUTPUT_DIR_BASE = 'analysis_output_weibo'  # Directory to save plots
+RESULTS_CACHE_DIR = 'analysis_cache_weibo'  # Directory for cached results
+
 # Limit processing for faster demo, set to None for all
 NUM_SAMPLES_TO_PROCESS = None  # None for all
 NUM_SAMPLES_TO_VISUALIZE = 10  # Number of sample images to show per class
@@ -204,6 +214,17 @@ def setup_feature_extractor():
     # print(preprocess)
 
     return feature_extractor_model, classifier_model, preprocess, device, imagenet_class_names
+
+
+# Add this function after the setup_feature_extractor() function
+def get_descriptive_label(label):
+    """Convert raw labels to more descriptive ones for visualization."""
+    label_map = {
+        'rumor': 'Rumor (Fake)',
+        'nonrumor': 'Non-Rumor (Real)',
+        # Add any other labels if they exist
+    }
+    return label_map.get(label, label)  # Return original if not in map
 
 
 # --- Main Analysis Function ---
@@ -399,7 +420,8 @@ def visualize_sample_images(results, n_samples=5, output_dir="."):
     labels = sorted(list(set(r['label'] for r in results)))
     print("\n--- Sample Images ---")
     for label in labels:
-        print(f"Label: {label}")
+        descriptive_label = get_descriptive_label(label)
+        print(f"Label: {descriptive_label}")
         label_results = [r for r in results if r['label'] == label]
         if not label_results:
             continue
@@ -425,7 +447,7 @@ def visualize_sample_images(results, n_samples=5, output_dir="."):
                 axes[i].axis('off')
                 print(f"Error loading sample {sample['path']}: {e}")
 
-        plt.suptitle(f"Sample Images - Label: {label}", y=1.05)
+        plt.suptitle(f"Sample Images - {descriptive_label}", y=1.05)
         plt.tight_layout()
         plt.savefig(os.path.join(
             output_dir, f"sample_images_{label}.png"), bbox_inches='tight')
@@ -439,7 +461,7 @@ def visualize_feature_distributions(results, output_dir="."):
     plot_data_list = []
     for r in results:
         plot_data_list.append({
-            'label': r['label'],
+            'label': get_descriptive_label(r['label']),  # Use descriptive label
             'width': r['width'],
             'height': r['height'],
             'aspect_ratio': r['aspect_ratio'],
@@ -453,6 +475,15 @@ def visualize_feature_distributions(results, output_dir="."):
 
     # Convert list of dicts to DataFrame
     plot_df = pd.DataFrame(plot_data_list)
+    
+    # Set reasonable plotting limits for each feature
+    plot_limits = {
+        'width': (0, min(3000, plot_df['width'].quantile(0.98))),  # Cap at 3000 or 98th percentile
+        'height': (0, min(3000, plot_df['height'].quantile(0.98))), # Cap at 3000 or 98th percentile
+        # Common aspect ratios 0.5-3.0
+        'aspect_ratio': (plot_df['aspect_ratio'].quantile(0.02), min(3.0, plot_df['aspect_ratio'].quantile(0.98))),
+        'blurriness': (0, plot_df['blurriness'].quantile(0.98)) # Cap at reasonable value
+    }
 
     features_to_plot = ['width', 'height', 'aspect_ratio', 'blurriness']
     # Determine the unique labels for consistent ordering in boxplot
@@ -473,10 +504,36 @@ def visualize_feature_distributions(results, output_dir="."):
             continue
 
         # Histogram / Density Plot using the DataFrame
+        # Use stat='density' for normalization
         sns.histplot(data=valid_df, x=feature,
-                     hue='label', kde=True, ax=axes[i, 0])
-        axes[i, 0].set_title(f"Distribution of {feature.capitalize()}")
-        axes[i, 0].legend(title='Label')  # Add legend to histplot
+                     hue='label', kde=True, ax=axes[i, 0], stat='density', common_norm=False)
+        axes[i, 0].set_title(f"Density Plot of {feature.capitalize()}")
+        axes[i, 0].set_xlabel(f"{feature.capitalize()} Value")
+        axes[i, 0].set_ylabel("Density") # Changed from Frequency
+        # Ensure legend is present
+        handles, current_labels = axes[i, 0].get_legend_handles_labels()
+        if handles: # Only add legend if there's something to show
+             axes[i, 0].legend(title='Class Label')
+        else:
+             axes[i, 0].legend_ = None # Remove empty legend box
+
+        # Set x-axis limits for histogram/density plot
+        axes[i, 0].set_xlim(plot_limits[feature])
+        
+        # For aspect ratio, add reference lines for common aspect ratios
+        if feature == 'aspect_ratio':
+            common_ratios = {
+                '1:1 (Square)': 1.0,
+                '4:3': 4/3,
+                '16:9': 16/9,
+                '3:4': 3/4,
+                '9:16': 9/16
+            }
+            for label, ratio in common_ratios.items():
+                if ratio >= plot_limits[feature][0] and ratio <= plot_limits[feature][1]:
+                    axes[i, 0].axvline(x=ratio, color='red', linestyle='--', alpha=0.7)
+                    axes[i, 0].text(ratio, axes[i, 0].get_ylim()[1]*0.9, label, 
+                                    rotation=90, verticalalignment='top', fontsize=8)
 
         # Box Plot using the DataFrame
         # Pass the DataFrame directly and specify x, y, and order
@@ -484,8 +541,11 @@ def visualize_feature_distributions(results, output_dir="."):
                     # Use unique_labels for order
                     ax=axes[i, 1], order=unique_labels)
         axes[i, 1].set_title(f"Box Plot of {feature.capitalize()}")
-        axes[i, 1].set_xlabel("Label")
-        axes[i, 1].set_ylabel(feature.capitalize())
+        axes[i, 1].set_xlabel("Class Label")
+        axes[i, 1].set_ylabel(f"{feature.capitalize()} Value")
+        
+        # Set y-axis limits for boxplot
+        axes[i, 1].set_ylim(plot_limits[feature])
 
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, "feature_distributions.png"))
@@ -498,7 +558,8 @@ def visualize_dominant_colors(results, n_samples=3, output_dir="."):
     print("\n--- Dominant Color Palettes ---")
     labels = sorted(list(set(r['label'] for r in results)))
     for label in labels:
-        print(f"Label: {label}")
+        descriptive_label = get_descriptive_label(label)
+        print(f"Label: {descriptive_label}")
         # Check if dominant_colors exists and is not empty
         label_results = [r for r in results if r['label']
                          == label and r.get('dominant_colors')]
@@ -509,7 +570,7 @@ def visualize_dominant_colors(results, n_samples=3, output_dir="."):
             n_samples, len(label_results)))
         for i, sample in enumerate(samples):
             fig = plot_color_palette(sample['dominant_colors'],
-                                     title=f"Dominant Colors ({label} - Sample {i+1}) - ID: {os.path.basename(sample['path']).split('.')[0]}")
+                                     title=f"Dominant Colors ({descriptive_label} - Sample {i+1}) - ID: {os.path.basename(sample['path']).split('.')[0]}")
             if fig:
                 plt.savefig(os.path.join(
                     output_dir, f"dominant_colors_{label}_sample{i+1}.png"), bbox_inches='tight')
@@ -526,7 +587,7 @@ def visualize_dominant_color_distribution(results, output_dir="."):
         # Check if dominant_colors exists and is not empty
         dominant_colors = r.get('dominant_colors')
         if dominant_colors:
-            label = r['label']
+            label = get_descriptive_label(r['label'])  # Use descriptive label
             # Normalize RGB to 0-1 range
             color_rgb = dominant_colors[0]
             r_norm, g_norm, b_norm = [x / 255.0 for x in color_rgb]
@@ -558,9 +619,11 @@ def visualize_dominant_color_distribution(results, output_dir="."):
     sns.scatterplot(data=color_df, x='Hue (degrees)', y='Saturation', hue='label',
                     alpha=0.6, s=30, edgecolor=None)  # Removed edgecolor for clarity
     plt.title('Most Dominant Color Distribution (Hue vs Saturation)')
+    plt.xlabel('Hue (degrees)')
+    plt.ylabel('Saturation (0-1)')
     plt.xlim(0, 360)
     plt.ylim(0, 1)
-    plt.legend(title='Label')
+    plt.legend(title='Class Label')
     plt.grid(True, linestyle='--', alpha=0.5)
     plt.savefig(os.path.join(output_dir, "dominant_color_hsv_scatter.png"))
     print(f"Saved dominant color HSV scatter plot to {output_dir}")
@@ -572,7 +635,7 @@ def visualize_dominant_color_distribution(results, output_dir="."):
 
     plot_params = {
         'fill': True,
-        'common_norm': False,  # Normalize each density independently
+        'common_norm': False,  # Normalize each density independently - Correct for comparing shapes
         'alpha': 0.5
     }
 
@@ -582,28 +645,41 @@ def visualize_dominant_color_distribution(results, output_dir="."):
     axes[0].set_title('Most Dominant Color Hue Distribution')
     axes[0].set_xlim(0, 360)
     axes[0].set_xlabel('Hue (degrees)')
+    axes[0].set_ylabel('Density')
+    # Explicitly add legend if needed (hue usually does it)
+    handles, current_labels = axes[0].get_legend_handles_labels()
+    if handles:
+        axes[0].legend(title='Class Label')
+    else:
+        axes[0].legend_ = None
 
     # Saturation KDE
     sns.kdeplot(data=color_df, x='Saturation',
                 hue='label', ax=axes[1], **plot_params)
     axes[1].set_title('Most Dominant Color Saturation Distribution')
     axes[1].set_xlim(0, 1)
-    axes[1].set_xlabel('Saturation')
+    axes[1].set_xlabel('Saturation (0-1)')
+    axes[1].set_ylabel('Density')
+    # Explicitly add legend if needed
+    handles, current_labels = axes[1].get_legend_handles_labels()
+    if handles:
+        axes[1].legend(title='Class Label')
+    else:
+        axes[1].legend_ = None
 
     # Value KDE
     sns.kdeplot(data=color_df, x='Value', hue='label',
                 ax=axes[2], **plot_params)
     axes[2].set_title('Most Dominant Color Value (Brightness) Distribution')
     axes[2].set_xlim(0, 1)
-    axes[2].set_xlabel('Value')
-
-    # Add legends to KDE plots if they exist
-    for ax in axes:
-        handles, current_labels = ax.get_legend_handles_labels()
-        if handles:
-            ax.legend(title='Label')
-        else:  # Remove empty legend boxes
-            ax.legend_ = None
+    axes[2].set_xlabel('Value (0-1)')
+    axes[2].set_ylabel('Density')
+    # Explicitly add legend if needed
+    handles, current_labels = axes[2].get_legend_handles_labels()
+    if handles:
+        axes[2].legend(title='Class Label')
+    else:
+        axes[2].legend_ = None
 
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, "dominant_color_hsv_kde.png"))
@@ -625,7 +701,9 @@ def visualize_dimensionality_reduction(results, method='umap', output_dir="."):
     deep_features = np.array([r['deep_features']
                              for r in results_with_features])
     # Use labels corresponding to filtered results
-    labels = [r['label'] for r in results_with_features]
+    raw_labels = [r['label'] for r in results_with_features]
+    # Convert to descriptive labels for visualization
+    descriptive_labels = [get_descriptive_label(label) for label in raw_labels]
 
     if deep_features.ndim != 2 or deep_features.shape[0] < 2:
         print("Not enough data or invalid feature shape for dimensionality reduction.")
@@ -664,11 +742,11 @@ def visualize_dimensionality_reduction(results, method='umap', output_dir="."):
     # Plotting
     plt.figure(figsize=(10, 8))
     sns.scatterplot(x=embedding[:, 0], y=embedding[:, 1],
-                    hue=labels, alpha=0.7, s=50)  # Increased point size
+                    hue=descriptive_labels, alpha=0.7, s=50)  # Increased point size
     plt.title(f'{method.upper()} Visualization of Image Features')
     plt.xlabel(f'{method.upper()} Component 1')
     plt.ylabel(f'{method.upper()} Component 2')
-    plt.legend(title='Label', loc='best')
+    plt.legend(title='Class Label', loc='best')
     plt.grid(True, linestyle='--', alpha=0.5)
     plt.savefig(os.path.join(output_dir, f"{method}_visualization.png"))
     print(f"Saved {method.upper()} visualization to {output_dir}")
@@ -685,8 +763,14 @@ def visualize_clustering(embedding, results_with_features, n_clusters, output_di
         print("Skipping clustering: Invalid embedding or not enough samples with features.")
         return
 
-    # Extract labels corresponding to the embedding
-    labels = [r['label'] for r in results_with_features]
+    # Extract labels corresponding to the embedding and calculate overall distribution
+    raw_labels = [r['label'] for r in results_with_features]
+    descriptive_labels = [get_descriptive_label(label) for label in raw_labels]
+    overall_label_counts = Counter(descriptive_labels)
+    total_samples = len(descriptive_labels)
+    overall_label_proportions = {label: count / total_samples
+                               for label, count in overall_label_counts.items()}
+
 
     print(f"\n--- Clustering (KMeans, k={n_clusters}) ---")
     kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
@@ -700,18 +784,18 @@ def visualize_clustering(embedding, results_with_features, n_clusters, output_di
     plt.xlabel('Component 1')
     plt.ylabel('Component 2')
     plt.legend(handles=scatter.legend_elements()[0], labels=[
-               f'Cluster {i}' for i in range(n_clusters)], title="Clusters")
+               f'Cluster {i}' for i in range(n_clusters)], title="Cluster Labels")
     plt.grid(True, linestyle='--', alpha=0.5)
-    plt.savefig(os.path.join(output_dir, "kmeans_clusters.png"))
-    print(f"Saved KMeans clustering visualization to {output_dir}")
+    plt.savefig(os.path.join(output_dir, "clustering_visualization.png"))
+    print(f"Saved clustering visualization to {output_dir}")
     plt.close()
 
     # Analyze cluster composition
     print("\nCluster Composition (Label Distribution):")
     for i in range(n_clusters):
         cluster_indices = np.where(cluster_labels == i)[0]
-        # Use labels from the filtered list
-        cluster_actual_labels = [labels[idx] for idx in cluster_indices]
+        # Use descriptive labels for better readability
+        cluster_actual_labels = [descriptive_labels[idx] for idx in cluster_indices]
         if not cluster_actual_labels:
             continue
         label_counts = Counter(cluster_actual_labels)
@@ -738,28 +822,47 @@ def visualize_clustering(embedding, results_with_features, n_clusters, output_di
         if n_rep_samples == 1:
             axes = [axes]  # Make sure axes is iterable
 
+        # Calculate normalized label proportions for this cluster
+        cluster_label_counts = Counter(
+            [descriptive_labels[idx] for idx in cluster_indices])
+        cluster_total = len(cluster_indices)
+        normalized_proportions_str = []
+        for label, count in sorted(cluster_label_counts.items()):
+            cluster_prop = count / cluster_total
+            overall_prop = overall_label_proportions.get(label, 0)
+            # Avoid division by zero; indicate if overall proportion is 0
+            if overall_prop > 0:
+                normalized_ratio = cluster_prop / overall_prop
+                normalized_proportions_str.append(
+                    f"{label}: {normalized_ratio:.1f}x")
+            else:
+                normalized_proportions_str.append(f"{label}: inf") # Or some indicator
+        proportion_title_part = " (Normalized: " + ", ".join(normalized_proportions_str) + ")"
+
+
         print(f"  Cluster {i}:")
         for j, sample in enumerate(sample_results):
             try:
                 img = Image.open(sample['path'])
+                descriptive_label = get_descriptive_label(sample['label'])
                 axes[j].imshow(img)
                 axes[j].set_title(
-                    f"Label: {sample['label']}\nID: {os.path.basename(sample['path']).split('.')[0]}", fontsize=8)
+                    f"Label: {descriptive_label}\nID: {os.path.basename(sample['path']).split('.')[0]}", fontsize=8)
                 axes[j].axis('off')
                 img.close()
             except Exception as e:
                 axes[j].set_title(
-                    f"Error loading\n{os.path.basename(sample['path']).split('.')[0]}")
+                    f"Error loading\n{os.path.basename(sample['path']).split('.')[0]}", fontsize=8) # Smaller font if needed
                 axes[j].axis('off')
 
-        plt.suptitle(f"Representative Images - Cluster {i}", y=1.05)
-        plt.tight_layout()
+        # Add normalized proportions to the title
+        plt.suptitle(f"Representative Images - Cluster {i}{proportion_title_part}", y=1.10, fontsize=10) # Adjust y and fontsize as needed
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95]) # Adjust rect to prevent overlap
         plt.savefig(os.path.join(
             output_dir, f"cluster_{i}_representatives.png"), bbox_inches='tight')
         plt.close(fig)
 
 
-# --- NEW VISUALIZATION FUNCTION ---
 def visualize_predicted_classes(results, top_n=TOP_N_CLASSES_TO_SHOW, output_dir="."):
     """Analyzes and visualizes the distribution of predicted ImageNet classes."""
     print(f"\n--- Predicted Class Analysis (Top {top_n}) ---")
@@ -771,9 +874,9 @@ def visualize_predicted_classes(results, top_n=TOP_N_CLASSES_TO_SHOW, output_dir
         print("No valid prediction results found to visualize.")
         return
 
-    # Create DataFrame
+    # Create DataFrame with descriptive labels
     pred_df = pd.DataFrame([{
-        'label': r['label'],
+        'label': get_descriptive_label(r['label']),  # Use descriptive label
         'predicted_class_name': r['predicted_class_name'],
         'prediction_confidence': r['prediction_confidence']
     } for r in pred_results])
@@ -807,12 +910,12 @@ def visualize_predicted_classes(results, top_n=TOP_N_CLASSES_TO_SHOW, output_dir
             sns.barplot(x=top_classes.values, y=top_classes.index,
                         ax=axes[i], palette="viridis", orient='h')
             axes[i].set_title(f"Top {top_n} Predicted Classes - {label}")
-            axes[i].set_xlabel("Count")
+            axes[i].set_xlabel("Count (Number of Images)")
             axes[i].set_ylabel("Predicted ImageNet Class")
             # Adjust label size if names are long
             axes[i].tick_params(axis='y', labelsize=8)
 
-    plt.suptitle("Most Frequent Predicted ImageNet Classes by Label", y=1.02)
+    plt.suptitle("Most Frequent Predicted ImageNet Classes by Data Label", y=1.02)
     # Adjust layout to prevent title overlap
     plt.tight_layout(rect=[0, 0.03, 1, 0.98])
     plt.savefig(os.path.join(
@@ -822,12 +925,19 @@ def visualize_predicted_classes(results, top_n=TOP_N_CLASSES_TO_SHOW, output_dir
 
     # --- Plot 2: Prediction Confidence Distribution ---
     fig, ax = plt.subplots(figsize=(10, 6))
+    # Use stat='density' for normalization
     sns.histplot(data=pred_df, x='prediction_confidence',
-                 hue='label', kde=True, ax=ax, bins=30)
-    ax.set_title("Distribution of Prediction Confidence by Label")
-    ax.set_xlabel("Prediction Confidence")
-    ax.set_ylabel("Count")
-    ax.legend(title='Label')
+                 hue='label', kde=True, ax=ax, bins=30, stat='density', common_norm=False)
+    ax.set_title("Density Distribution of Prediction Confidence by Class")
+    ax.set_xlabel("Prediction Confidence (0-1)")
+    ax.set_ylabel("Density") # Changed from Count
+    # Ensure legend is present
+    handles, current_labels = ax.get_legend_handles_labels()
+    if handles:
+        ax.legend(title='Class Label')
+    else:
+        ax.legend_ = None
+
     plt.tight_layout()
     plt.savefig(os.path.join(
         output_dir, "prediction_confidence_distribution.png"))
@@ -857,7 +967,7 @@ if __name__ == "__main__":
     # 1. Load Data Paths and Labels
     print("\n--- 1. Loading Data ---")
     try:
-        loader = PostDataLoader(POSTS_FILE_PATH, IMAGES_DIR_PATH)
+        loader = DATA_LOADER(*DATA_LOADER_ARGS)
         loader.load_data()
         print(
             f"Found {len(loader.get_path_label_pairs())} image path-label pairs.")
@@ -959,3 +1069,4 @@ if __name__ == "__main__":
     print(f"Check the '{OUTPUT_DIR}' directory for saved plots.")
     if os.path.exists(cache_filepath):
         print(f"Analysis results cached at: {cache_filepath}")
+

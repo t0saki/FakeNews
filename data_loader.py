@@ -123,7 +123,26 @@ class PostDataLoader:
                 print(
                     f"An unexpected error occurred while reading {file_path}: {e}")
         
-        print(f"\nTotal image path-label pairs loaded: {len(self.image_path_label_data)}")
+        # Deduplicate entries based on file paths
+        original_count = len(self.image_path_label_data)
+        self._deduplicate_entries()
+        print(f"\nTotal image path-label pairs loaded: {len(self.image_path_label_data)} (Removed {original_count - len(self.image_path_label_data)} duplicates)")
+
+    def _deduplicate_entries(self):
+        """
+        Removes duplicate entries from image_path_label_data based on file paths.
+        If duplicate entries with different labels exist, keeps the first occurrence.
+        """
+        seen_paths = set()
+        unique_entries = []
+        
+        for image_path, label in self.image_path_label_data:
+            # Check if we've already seen this path
+            if image_path not in seen_paths:
+                seen_paths.add(image_path)
+                unique_entries.append((image_path, label))
+                
+        self.image_path_label_data = unique_entries
 
     def get_path_label_pairs(self) -> List[Tuple[str, str]]:
         """
@@ -181,63 +200,231 @@ class PostDataLoader:
         print(f"Successfully loaded {loaded_count} actual image-label pairs.")
         return loaded_pairs
 
+# --- New Directory Data Loader Class ---
+class DirectoryDataLoader:
+    """
+    Loads image paths and labels directly from specified directories,
+    assuming subdirectories correspond to labels (e.g., 'rumor', 'non-rumor').
+
+    Recursively searches for image files within the provided directories.
+    Supported image types: .jpg, .jpeg, .png, .gif, .bmp
+    """
+    SUPPORTED_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp'}
+
+    def __init__(self, rumor_dirs: List[str], non_rumor_dirs: List[str]):
+        """
+        Initializes the loader with lists of paths to rumor and non-rumor image directories.
+
+        Args:
+            rumor_dirs (List[str]): A list of paths to directories containing rumor images.
+            non_rumor_dirs (List[str]): A list of paths to directories containing non-rumor images.
+
+        Raises:
+            FileNotFoundError: If any specified directory does not exist.
+            ValueError: If both rumor_dirs and non_rumor_dirs are empty.
+        """
+        self.rumor_dirs = []
+        self.non_rumor_dirs = []
+
+        if not rumor_dirs and not non_rumor_dirs:
+            raise ValueError("At least one rumor or non-rumor directory must be provided.")
+
+        for dir_path in rumor_dirs:
+            if not os.path.isdir(dir_path):
+                raise FileNotFoundError(f"Rumor directory not found: {dir_path}")
+            self.rumor_dirs.append(dir_path)
+
+        for dir_path in non_rumor_dirs:
+            if not os.path.isdir(dir_path):
+                raise FileNotFoundError(f"Non-rumor directory not found: {dir_path}")
+            self.non_rumor_dirs.append(dir_path)
+
+        self.image_path_label_data: List[Tuple[str, str]] = []
+
+    def load_data(self):
+        """
+        Scans the specified directories recursively, identifies image files,
+        and stores their paths along with assigned labels ('rumor' or 'non-rumor').
+
+        Populates the self.image_path_label_data list.
+        """
+        self.image_path_label_data = [] # Reset data
+        found_count = 0
+
+        # Process rumor directories
+        for dir_path in self.rumor_dirs:
+            print(f"Scanning rumor directory: {dir_path}")
+            count_in_dir = 0
+            for root, _, files in os.walk(dir_path):
+                for filename in files:
+                    _, ext = os.path.splitext(filename)
+                    if ext.lower() in self.SUPPORTED_EXTENSIONS:
+                        image_path = os.path.join(root, filename)
+                        self.image_path_label_data.append((image_path, 'rumor'))
+                        count_in_dir += 1
+            print(f"  Found {count_in_dir} images in {dir_path}")
+            found_count += count_in_dir
+
+        # Process non-rumor directories
+        for dir_path in self.non_rumor_dirs:
+            print(f"Scanning non-rumor directory: {dir_path}")
+            count_in_dir = 0
+            for root, _, files in os.walk(dir_path):
+                for filename in files:
+                    _, ext = os.path.splitext(filename)
+                    if ext.lower() in self.SUPPORTED_EXTENSIONS:
+                        image_path = os.path.join(root, filename)
+                        self.image_path_label_data.append((image_path, 'non-rumor'))
+                        count_in_dir += 1
+            print(f"  Found {count_in_dir} images in {dir_path}")
+            found_count += count_in_dir
+
+        print(f"\nTotal image path-label pairs found: {len(self.image_path_label_data)}")
+        # Consider adding shuffling here if needed:
+        # import random
+        # random.shuffle(self.image_path_label_data)
+
+    def get_path_label_pairs(self) -> List[Tuple[str, str]]:
+        """
+        Returns the loaded list of (image_path, label) tuples.
+
+        Returns:
+            list[tuple[str, str]]: A list of tuples, where each tuple
+                                   contains a full image path and its corresponding label ('rumor' or 'non-rumor').
+        """
+        return self.image_path_label_data
+
+    def load_image_label_pairs(self, limit=None) -> List[Tuple[Image.Image, str]]:
+        """
+        Loads images from the stored paths and returns them with their labels.
+
+        Args:
+            limit (int, optional): Maximum number of image-label pairs to load.
+                                   Defaults to None (load all).
+
+        Returns:
+            list[tuple[PIL.Image.Image, str]]: A list of tuples, where each tuple contains
+                                               a loaded PIL Image object and its label.
+                                               Returns an empty list if data hasn't been loaded
+                                               or if errors occur during image loading.
+        """
+        # This method is identical in function to the one in PostDataLoader
+        loaded_pairs = []
+        data_to_load = self.image_path_label_data[:limit] if limit is not None else self.image_path_label_data
+
+        print(f"Attempting to load {len(data_to_load)} images...")
+        loaded_count = 0
+        skipped_count = 0
+
+        for image_path, label in data_to_load:
+            try:
+                img = Image.open(image_path)
+                # img.load() # Uncomment if you need pixel data immediately
+                loaded_pairs.append((img, label))
+                loaded_count += 1
+            except FileNotFoundError:
+                # print(f"Warning: Image file not found: {image_path}. Skipping.")
+                skipped_count += 1
+            except UnidentifiedImageError:
+                # print(f"Warning: Could not identify or open image file: {image_path}. Skipping.")
+                skipped_count += 1
+            except Exception as e:
+                print(f"Warning: An error occurred loading image {image_path}: {e}. Skipping.")
+                skipped_count += 1
+
+        if skipped_count > 0:
+            print(f"Warning: Skipped loading {skipped_count} images due to errors.")
+        print(f"Successfully loaded {loaded_count} actual image-label pairs.")
+        return loaded_pairs
+
+
 # --- Example Usage ---
-# Example structure assuming you have multiple sets, e.g., train and dev
-# Replace with your actual paths
 
 if __name__ == "__main__":
+
+    # --- Example for PostDataLoader ---
+    print("--- Testing PostDataLoader ---")
     # Example: Define multiple dataset paths
     base_dir_dev = 'data/twitter_dataset/devset'
     posts_file_dev = os.path.join(base_dir_dev, 'posts.txt')
     images_dir_dev = os.path.join(base_dir_dev, 'images')
 
-    # Add another set (e.g., a training set if you had one)
-    # base_dir_train = 'data/twitter_dataset/trainset' # Hypothetical
-    # posts_file_train = os.path.join(base_dir_train, 'posts.txt')
-    # images_dir_train = os.path.join(base_dir_train, 'images')
-
     # Create lists of paths
-    all_posts_files = [posts_file_dev]  # Add posts_file_train here if needed
-    all_images_dirs = [images_dir_dev]  # Add images_dir_train here if needed
+    all_posts_files = [posts_file_dev]
+    all_images_dirs = [images_dir_dev]
 
     try:
-        # Create an instance of the loader with the lists
         loader = PostDataLoader(all_posts_files, all_images_dirs)
-
-        # Load the data (paths and labels) from all specified sources
         loader.load_data()
-
-        # Get the aggregated path-label pairs
         path_label_pairs = loader.get_path_label_pairs()
-        print(
-            f"\nSuccessfully found {len(path_label_pairs)} total image path-label pairs.")
+        print(f"\nPostDataLoader: Found {len(path_label_pairs)} path-label pairs.")
         if path_label_pairs:
-            print("First 5 path-label pairs:", path_label_pairs[:5])
-            print("Last 5 path-label pairs:", path_label_pairs[-5:])
+            print("First 5:", path_label_pairs[:5])
 
-        # Load the actual images and labels (e.g., load the first 10 from the aggregated list)
-        print("\nLoading first 10 images from the combined dataset...")
-        image_label_pairs = loader.load_image_label_pairs(limit=10)
+        print("\nPostDataLoader: Loading first 5 images...")
+        image_label_pairs = loader.load_image_label_pairs(limit=5)
         # Print details already handled within load_image_label_pairs
 
-        # Example: Accessing the first loaded image and its label
         if image_label_pairs:
             first_image, first_label = image_label_pairs[0]
-            print(f"\nDetails of the first loaded image:")
+            print(f"\nPostDataLoader: First loaded image details:")
             print(f"  Label: {first_label}")
             print(f"  Image object: {first_image}")
-            print(f"  Image format: {first_image.format}")
-            print(f"  Image size: {first_image.size}")
-            print(f"  Image mode: {first_image.mode}")
-            # Remember to close the image file if you are done with it
-            first_image.close()
+            first_image.close() # Close image after inspection
 
-    except FileNotFoundError as e:
-        print(f"\nError during setup: {e}")
-    except ValueError as e:
-        print(f"\nError during setup: {e}")
-    except ImportError:
-        print(
-            "\nError: Pillow library not found. Please install it using 'pip install Pillow'")
+    except (FileNotFoundError, ValueError, ImportError) as e:
+        print(f"\nError during PostDataLoader setup/run: {e}")
     except Exception as e:
-        print(f"\nAn error occurred during execution: {e}")
+        print(f"\nAn unexpected error occurred during PostDataLoader execution: {e}")
+
+
+    # --- Example for DirectoryDataLoader ---
+    print("\n\n--- Testing DirectoryDataLoader ---")
+    # Define placeholder paths for rumor and non-rumor directories
+    # *** Replace these with your actual directory paths ***
+    # e.g., ['path/to/rumor_set1', 'path/to/rumor_set2']
+    example_rumor_dirs = ['/mnt/d/LFDev-D/weibo_dataset/rumor_images']
+    example_non_rumor_dirs = ['/mnt/d/LFDev-D/weibo_dataset/nonrumor_images']
+
+    # Create dummy directories and files for the example if they don't exist
+    # You might want to remove this part if you provide real paths
+    for d in example_rumor_dirs + example_non_rumor_dirs:
+        os.makedirs(d, exist_ok=True)
+    # Create dummy image files (optional, for demonstration)
+    try:
+        Image.new('RGB', (60, 30), color = 'red').save(os.path.join(example_rumor_dirs[0], 'rumor1.jpg'))
+        Image.new('RGB', (60, 30), color = 'green').save(os.path.join(example_non_rumor_dirs[0], 'nonrumor1.png'))
+        Image.new('RGB', (60, 30), color = 'blue').save(os.path.join(example_non_rumor_dirs[0], 'nonrumor2.jpeg'))
+        # Add a non-image file to test filtering
+        with open(os.path.join(example_non_rumor_dirs[0], 'notes.txt'), 'w') as f:
+            f.write("this is not an image")
+    except ImportError:
+         print("\nWarning: Pillow not installed, cannot create dummy images for DirectoryDataLoader example.")
+    except Exception as e:
+         print(f"\nWarning: Could not create dummy image files: {e}")
+
+
+    try:
+        dir_loader = DirectoryDataLoader(rumor_dirs=example_rumor_dirs, non_rumor_dirs=example_non_rumor_dirs)
+        dir_loader.load_data() # Scan directories and collect paths/labels
+
+        dir_path_label_pairs = dir_loader.get_path_label_pairs()
+        print(f"\nDirectoryDataLoader: Found {len(dir_path_label_pairs)} total image path-label pairs.")
+        if dir_path_label_pairs:
+            print("First 5 path-label pairs:", dir_path_label_pairs[:5])
+
+        print("\nDirectoryDataLoader: Loading first 5 images (or all if fewer)...")
+        dir_image_label_pairs = dir_loader.load_image_label_pairs(limit=5)
+
+        if dir_image_label_pairs:
+            img, lbl = dir_image_label_pairs[0]
+            print(f"\nDirectoryDataLoader: First loaded image details:")
+            print(f"  Label: {lbl}")
+            print(f"  Image object: {img}")
+            print(f"  Format: {img.format}, Size: {img.size}, Mode: {img.mode}")
+            img.close() # Close image
+
+    except (FileNotFoundError, ValueError, ImportError) as e:
+        print(f"\nError during DirectoryDataLoader setup/run: {e}")
+    except Exception as e:
+        print(f"\nAn unexpected error occurred during DirectoryDataLoader execution: {e}")
