@@ -1,3 +1,6 @@
+import matplotlib
+# Set the backend *before* importing pyplot
+matplotlib.use('Agg')
 import os
 import random
 from collections import Counter
@@ -31,9 +34,8 @@ from concurrent.futures import ProcessPoolExecutor
 from data_loader import PostDataLoader
 
 # --- Configuration ---
-BASE_DIR = 'data/twitter_dataset/devset'
-POSTS_FILE_PATH = os.path.join(BASE_DIR, 'posts.txt')
-IMAGES_DIR_PATH = os.path.join(BASE_DIR, 'images')
+POSTS_FILE_PATH = ['data/twitter_dataset/devset/posts.txt']
+IMAGES_DIR_PATH = ['data/twitter_dataset/devset/images']
 OUTPUT_DIR_BASE = 'analysis_output'  # Directory to save plots
 RESULTS_CACHE_DIR = 'analysis_cache'  # Directory for cached results
 # Limit processing for faster demo, set to None for all
@@ -838,6 +840,7 @@ if __name__ == "__main__":
     # Set the start method to 'spawn' to avoid potential deadlocks on Linux
     # Needs to be done early, within the main block
     try:
+        # Ensure spawn is used, especially important if Tkinter issues arise
         multiprocessing.set_start_method('spawn', force=True)
         print("Set multiprocessing start method to 'spawn'.")
     except RuntimeError:
