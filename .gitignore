@@ -1,6 +1,6 @@
 temp
 data
-analysis_output
+analysis_output*
 analysis_cache
 
 .vscode

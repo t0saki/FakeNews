@@ -3,6 +3,8 @@ import random
 from collections import Counter
 import pickle
 import colorsys
+import multiprocessing
+import math
 
 import cv2
 import matplotlib.pyplot as plt
@@ -24,6 +26,7 @@ except ImportError:
     HAS_UMAP = False
 from tqdm import tqdm
 import pandas as pd
+from concurrent.futures import ProcessPoolExecutor
 
 from data_loader import PostDataLoader
 
@@ -31,15 +34,32 @@ from data_loader import PostDataLoader
 BASE_DIR = 'data/twitter_dataset/devset'
 POSTS_FILE_PATH = os.path.join(BASE_DIR, 'posts.txt')
 IMAGES_DIR_PATH = os.path.join(BASE_DIR, 'images')
-OUTPUT_DIR = 'analysis_output'  # Directory to save plots
+OUTPUT_DIR_BASE = 'analysis_output'  # Directory to save plots
 RESULTS_CACHE_DIR = 'analysis_cache'  # Directory for cached results
 # Limit processing for faster demo, set to None for all
-NUM_SAMPLES_TO_PROCESS = 100  # None for all
+NUM_SAMPLES_TO_PROCESS = None  # None for all
 NUM_SAMPLES_TO_VISUALIZE = 10  # Number of sample images to show per class
 TSNE_PERPLEXITY = 30        # t-SNE parameter
 UMAP_N_NEIGHBORS = 15       # UMAP parameter
 UMAP_MIN_DIST = 0.1         # UMAP parameter
 CLUSTER_N = 5               # Number of clusters for KMeans
+DEEP_FEATURE_BATCH_SIZE = 128  # Batch size for deep feature extraction
+NUM_PARALLEL_WORKERS = min(multiprocessing.cpu_count(), 4)  # Limit CPU workers
+# Batch size for parallel basic feature processing
+BASIC_PROCESSING_BATCH_SIZE = 32
+# Add config for prediction visualization
+TOP_N_CLASSES_TO_SHOW = 20  # Number of top predicted classes to show in plots
+
+# Construct cache filename based on limit
+limit_str = "all" if NUM_SAMPLES_TO_PROCESS is None else str(
+    NUM_SAMPLES_TO_PROCESS)
+
+OUTPUT_DIR = os.path.join(OUTPUT_DIR_BASE, limit_str)
+
+# Set OMP_NUM_THREADS
+os.environ["OMP_NUM_THREADS"] = str(
+    int(multiprocessing.cpu_count() / NUM_PARALLEL_WORKERS))
+
 
 # Ensure output and cache directories exist
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -53,9 +73,9 @@ def calculate_blurriness(pil_image):
     try:
         # Convert PIL Image (RGB) to OpenCV format (BGR NumPy array)
         img = np.array(pil_image)
-        img = img[:, :, ::-1].copy() # Convert RGB to BGR
+        img = img[:, :, ::-1].copy()  # Convert RGB to BGR
 
-        if img is None: # Should not happen if pil_image is valid
+        if img is None:  # Should not happen if pil_image is valid
             return None
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         # Adjust ksize for sensitivity: smaller detects finer edges (less blur)
@@ -106,49 +126,88 @@ def plot_color_palette(colors, title="Dominant Colors"):
     return fig
 
 
+# --- Worker Function for Parallel Basic Processing ---
+def _process_single_image_basic(args):
+    """Processes basic info, blur, and colors for a single image."""
+    image_path, label = args
+    try:
+        # Basic check first
+        if not os.path.exists(image_path):
+            return {'path': image_path, 'label': label, 'error': 'File not found'}
+
+        pil_img = Image.open(image_path).convert('RGB')
+        width, height = pil_img.size
+        aspect_ratio = width / height if height > 0 else 0
+
+        # Calculate low-level features
+        blur = calculate_blurriness(pil_img)  # Assumes modified version
+        dominant_colors = extract_dominant_colors(pil_img, k=5)
+
+        pil_img.close()  # Close image after basic processing
+
+        return {
+            "path": image_path,
+            "label": label,
+            "width": width,
+            "height": height,
+            "aspect_ratio": aspect_ratio,
+            "blurriness": blur,
+            "dominant_colors": dominant_colors,
+            "error": None
+        }
+    except UnidentifiedImageError:
+        return {'path': image_path, 'label': label, 'error': 'UnidentifiedImageError'}
+    except Exception as e:
+        # Log the full error if needed
+        return {'path': image_path, 'label': label, 'error': f'Basic processing error: {type(e).__name__}'}
+
+
+def process_basic_batch(batch_args):
+    """Processes a batch of images for basic features."""
+    results = []
+    for args in batch_args:
+        results.append(_process_single_image_basic(args))
+    return results
+
+
 # --- Feature Extraction Setup (Deep Learning) ---
 def setup_feature_extractor():
-    """Loads a pre-trained ResNet model for feature extraction."""
+    """Loads a pre-trained ResNet model for feature extraction and classification."""
     # Use GPU if available
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # Load pre-trained ResNet50
-    # Use updated weights API
-    model = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V2)
-    # Remove the final classification layer
-    model = torch.nn.Sequential(*(list(model.children())[:-1]))
-    model = model.to(device)
-    model.eval()  # Set to evaluation mode
+    # Load pre-trained ResNet50 weights
+    weights = models.ResNet50_Weights.IMAGENET1K_V2
+    # Get class names from metadata
+    imagenet_class_names = weights.meta["categories"]
+
+    # 1. Model for Feature Extraction (remove final layer)
+    feature_extractor_model = models.resnet50(weights=weights)
+    feature_extractor_model = torch.nn.Sequential(
+        *(list(feature_extractor_model.children())[:-1]))
+    feature_extractor_model = feature_extractor_model.to(device)
+    feature_extractor_model.eval()  # Set to evaluation mode
+
+    # 2. Model for Classification (full model)
+    classifier_model = models.resnet50(weights=weights)
+    classifier_model = classifier_model.to(device)
+    classifier_model.eval()  # Set to evaluation mode
 
     # Define the image transformations required by ResNet
-    preprocess = transforms.Compose([
-        transforms.Resize(256),
-        transforms.CenterCrop(224),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[
-                             0.229, 0.224, 0.225]),
-    ])
-    return model, preprocess, device
+    preprocess = weights.transforms()  # Use transforms associated with the weights
 
+    # Print some info about transforms if needed
+    # print("Using transforms:")
+    # print(preprocess)
 
-def extract_deep_features(pil_image, model, preprocess, device):
-    """Extracts features from an image using the pre-trained model."""
-    try:
-        img_t = preprocess(pil_image)
-        batch_t = torch.unsqueeze(img_t, 0).to(device)  # Create a mini-batch
-        with torch.no_grad():
-            features = model(batch_t)
-        # Flatten the features and move to CPU
-        return features.squeeze().cpu().numpy()
-    except Exception as e:
-        # print(f"Error extracting deep features: {e}")
-        return None
+    return feature_extractor_model, classifier_model, preprocess, device, imagenet_class_names
 
 
 # --- Main Analysis Function ---
-def analyze_images(loader, feature_extractor, preprocess, device, limit=None):
-    """Performs the core analysis on the loaded image data."""
+def analyze_images(loader, feature_extractor, classifier_model, preprocess, device, imagenet_class_names,  # Added classifier and names
+                   limit=None, batch_size=DEEP_FEATURE_BATCH_SIZE, num_workers=NUM_PARALLEL_WORKERS):
+    """Performs the core analysis with parallel basic features, batched deep features, and class predictions."""
     path_label_pairs = loader.get_path_label_pairs()
     if not path_label_pairs:
         print("No path-label pairs found. Exiting analysis.")
@@ -158,65 +217,177 @@ def analyze_images(loader, feature_extractor, preprocess, device, limit=None):
         print(f"Processing a random sample of {limit} images.")
         path_label_pairs = random.sample(path_label_pairs, limit)
     else:
-        print(f"Processing all {len(path_label_pairs)} images.")
+        limit = len(path_label_pairs)  # Use actual number for progress bar
+        print(f"Processing all {limit} images.")
 
-    results = []
-    print("Starting feature extraction...")
-    for image_path, label in tqdm(path_label_pairs):
-        try:
-            # Basic check
-            if not os.path.exists(image_path):
-                # print(f"Warning: File not found during analysis: {image_path}. Skipping.")
-                continue
+    # --- 1. Parallel Basic Feature Extraction ---
+    basic_results_intermediate = []
+    print(
+        f"\nStarting basic feature extraction (parallel, {num_workers} workers, batch size: {BASIC_PROCESSING_BATCH_SIZE})...")
 
-            # Load Image using Pillow (needed for deep features & dominant colors)
-            pil_img = Image.open(image_path).convert(
-                'RGB')  # Ensure RGB for consistency
+    # Group into batches
+    num_batches = math.ceil(len(path_label_pairs) /
+                            BASIC_PROCESSING_BATCH_SIZE)
+    batches = [path_label_pairs[i * BASIC_PROCESSING_BATCH_SIZE:(i + 1) * BASIC_PROCESSING_BATCH_SIZE]
+               for i in range(num_batches)]
 
-            # 1. Basic Metadata (can be expanded with EXIF if needed)
-            width, height = pil_img.size
-
-            # 2. Low-level Features
-            blur = calculate_blurriness(pil_img)
-            dominant_colors = extract_dominant_colors(pil_img, k=5)
-
-            # 3. Deep Learning Features
-            deep_features = extract_deep_features(
-                pil_img, feature_extractor, preprocess, device)
-
-            # Close the image file handle
-            pil_img.close()
-
-            if deep_features is not None:  # Only store if deep features were successful
-                results.append({
-                    "path": image_path,
-                    "label": label,
-                    "width": width,
-                    "height": height,
-                    "aspect_ratio": width / height if height > 0 else 0,
-                    "blurriness": blur,
-                    "dominant_colors": dominant_colors,
-                    "deep_features": deep_features
-                })
-
-        except UnidentifiedImageError:
-            # print(f"Warning: Could not identify image {image_path}. Skipping.")
-            continue
-        except Exception as e:
-            print(
-                f"Warning: Unexpected error processing {image_path}: {e}. Skipping.")
-            # Ensure image is closed even on error if pil_img was opened
+    # Use ProcessPoolExecutor
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        # Submit batches to the new worker function
+        futures = [executor.submit(process_basic_batch, batch)
+                   for batch in batches]
+        # Collect results (each future returns a list of results)
+        for future in tqdm(futures, total=len(batches), desc="Basic Feature Batches"):
             try:
-                pil_img.close()
-            except:
+                batch_result = future.result()
+                basic_results_intermediate.extend(
+                    batch_result)  # Extend the list
+            except Exception as e:
+                # Note: This error might hide which specific image(s) failed within the batch
+                print(f"Error processing a batch: {e}")
+                # Optionally, add placeholder errors or try to determine failed items if needed
                 pass
 
-    if not results:
-        print("No images were successfully processed.")
+    # Filter out errors and collect valid basic results
+    basic_results = []
+    error_counts = Counter()
+    for res in basic_results_intermediate:
+        if res.get('error') is None:
+            # Remove the 'error' key before appending
+            res.pop('error', None)
+            # Initialize new keys for deep features and predictions
+            res['deep_features'] = None
+            res['predicted_class_index'] = None
+            res['predicted_class_name'] = None
+            res['prediction_confidence'] = None
+            basic_results.append(res)
+        else:
+            error_counts[res['error']] += 1
+            # Optional: print detailed warnings
+            # print(f"Warning: Skipping {res['path']} due to: {res['error']}")
+
+    if error_counts:
+        print("\nErrors during basic feature extraction:")
+        for error_type, count in error_counts.items():
+            print(f"  - {error_type}: {count} images")
+
+    if not basic_results:
+        print("No images successfully processed for basic features.")
         return None
 
-    print(f"\nSuccessfully processed {len(results)} images.")
-    return results
+    print(
+        f"Successfully processed basic features for {len(basic_results)} images.")
+
+    # --- 2. Batched Deep Feature Extraction & Classification ---
+    print(
+        f"\nStarting deep feature extraction & classification (batch size: {batch_size})...")
+    # Use the successfully processed basic results as the base
+    final_results = basic_results  # Already contains initialized prediction keys
+    num_batches = math.ceil(len(final_results) / batch_size)
+
+    processed_deep_count = 0
+    processed_prediction_count = 0
+    # Combine errors for deep features and classification
+    deep_feature_errors = Counter()
+
+    for i in tqdm(range(num_batches), desc="Deep Features & Prediction Batches"):
+        batch_start = i * batch_size
+        batch_end = min((i + 1) * batch_size, len(final_results))
+        current_batch_indices = list(range(batch_start, batch_end))
+
+        batch_tensors = []
+        # Store original indices (within final_results) for this batch
+        indices_in_batch = []
+
+        # Prepare tensors for the current batch
+        for original_index in current_batch_indices:
+            image_path = final_results[original_index]['path']
+            try:
+                # Load and preprocess specifically for the model
+                pil_img = Image.open(image_path).convert('RGB')
+                img_t = preprocess(pil_img)
+                pil_img.close()
+                batch_tensors.append(img_t)
+                indices_in_batch.append(original_index)
+            except UnidentifiedImageError:
+                deep_feature_errors['UnidentifiedImageError'] += 1
+                # print(f"Warning: Could not identify image {image_path} during deep feature batching. Skipping deep features & prediction.")
+                pass  # deep_features & predictions remain None
+            except Exception as e:
+                error_key = f'Preprocessing error: {type(e).__name__}'
+                deep_feature_errors[error_key] += 1
+                # print(f"Warning: Error preprocessing {image_path} for deep features: {e}. Skipping deep features & prediction.")
+                pass  # deep_features & predictions remain None
+
+        # Process the batch if any images were successfully preprocessed
+        if batch_tensors:
+            batch_t = torch.stack(batch_tensors).to(device)
+            try:
+                with torch.no_grad():
+                    # 1. Extract Features
+                    batch_features = feature_extractor(batch_t)
+                    # 2. Get Predictions
+                    outputs = classifier_model(batch_t)
+                    probabilities = torch.softmax(outputs, dim=1)
+                    top_prob, top_idx = torch.topk(probabilities, 1, dim=1)
+
+                # --- Process Features ---
+                if batch_features.dim() > 2:
+                    batch_features = batch_features.squeeze(-1).squeeze(-1)
+                batch_features_np = batch_features.cpu().numpy()
+
+                # --- Process Predictions ---
+                top_prob_np = top_prob.cpu().numpy().flatten()
+                top_idx_np = top_idx.cpu().numpy().flatten()
+
+                # --- Assign features and predictions back ---
+                if len(batch_features_np) == len(indices_in_batch) and len(top_idx_np) == len(indices_in_batch):
+                    for idx_in_batch, original_idx in enumerate(indices_in_batch):
+                        # Assign features
+                        final_results[original_idx]['deep_features'] = batch_features_np[idx_in_batch]
+                        processed_deep_count += 1
+                        # Assign predictions
+                        pred_idx = top_idx_np[idx_in_batch]
+                        final_results[original_idx]['predicted_class_index'] = pred_idx
+                        final_results[original_idx]['predicted_class_name'] = imagenet_class_names[pred_idx]
+                        final_results[original_idx]['prediction_confidence'] = top_prob_np[idx_in_batch]
+                        processed_prediction_count += 1
+
+                else:
+                    mismatch_key = f'Batch/Output size mismatch (batch {i})'
+                    # Count all affected
+                    deep_feature_errors[mismatch_key] += len(indices_in_batch)
+                    print(
+                        f"Warning: Mismatch between input batch size and feature/prediction output size for batch {i}. Features/predictions for this batch might be incorrect or missing.")
+
+            except Exception as e:
+                error_key = f'Model inference error (batch {i}): {type(e).__name__}'
+                # Count all affected
+                deep_feature_errors[error_key] += len(indices_in_batch)
+                print(
+                    f"Error during model inference for batch {i}: {e}. Skipping deep features & predictions for this batch.")
+                # No features/predictions assigned, they remain None for this batch
+
+    # --- Analysis Completion ---\n"
+    if deep_feature_errors:
+        print("\nErrors during deep feature extraction:")
+        for error_type, count in deep_feature_errors.items():
+            print(f"  - {error_type}: {count} images affected")
+
+    if not final_results:
+        print("\nNo images were successfully processed in total.")
+        return None
+
+    # Final count report
+    print(
+        f"\nSuccessfully processed {len(final_results)} images in total (basic features).")
+    print(f"  - Extracted deep features for {processed_deep_count} images.")
+    print(
+        f"  - Generated ImageNet predictions for {processed_prediction_count} images.")
+
+    # Filter out results where deep features failed, if necessary downstream
+    # For now, return all results, some may have deep_features=None or predictions=None
+    return final_results
 
 # --- Visualization Functions ---
 
@@ -326,8 +497,9 @@ def visualize_dominant_colors(results, n_samples=3, output_dir="."):
     labels = sorted(list(set(r['label'] for r in results)))
     for label in labels:
         print(f"Label: {label}")
+        # Check if dominant_colors exists and is not empty
         label_results = [r for r in results if r['label']
-                         == label and r['dominant_colors']]
+                         == label and r.get('dominant_colors')]
         if not label_results:
             continue
 
@@ -349,21 +521,23 @@ def visualize_dominant_color_distribution(results, output_dir="."):
     hues, saturations, values, labels = [], [], [], []
 
     for r in results:
-        # Use only the most dominant color (index 0)
-        if r['dominant_colors']:
+        # Check if dominant_colors exists and is not empty
+        dominant_colors = r.get('dominant_colors')
+        if dominant_colors:
             label = r['label']
             # Normalize RGB to 0-1 range
-            color_rgb = r['dominant_colors'][0]
+            color_rgb = dominant_colors[0]
             r_norm, g_norm, b_norm = [x / 255.0 for x in color_rgb]
             # Convert to HSV
             try:
                 h, s, v = colorsys.rgb_to_hsv(r_norm, g_norm, b_norm)
-                hues.append(h * 360) # Hue in degrees (0-360)
+                hues.append(h * 360)  # Hue in degrees (0-360)
                 saturations.append(s)
                 values.append(v)
                 labels.append(label)
             except Exception as e:
-                print(f"Warning: Could not convert color {color_rgb} to HSV for {r['path']}: {e}")
+                print(
+                    f"Warning: Could not convert color {color_rgb} to HSV for {r['path']}: {e}")
 
     if not hues:
         print("No dominant color data found for distribution plotting.")
@@ -379,7 +553,8 @@ def visualize_dominant_color_distribution(results, output_dir="."):
 
     # Plot 1: Hue vs Saturation Scatter Plot
     plt.figure(figsize=(10, 8))
-    sns.scatterplot(data=color_df, x='Hue (degrees)', y='Saturation', hue='label', alpha=0.6, s=30, edgecolor=None) # Removed edgecolor for clarity
+    sns.scatterplot(data=color_df, x='Hue (degrees)', y='Saturation', hue='label',
+                    alpha=0.6, s=30, edgecolor=None)  # Removed edgecolor for clarity
     plt.title('Most Dominant Color Distribution (Hue vs Saturation)')
     plt.xlim(0, 360)
     plt.ylim(0, 1)
@@ -390,28 +565,32 @@ def visualize_dominant_color_distribution(results, output_dir="."):
     plt.close()
 
     # Plot 2: KDE plots for H, S, V
-    fig, axes = plt.subplots(3, 1, figsize=(10, 12), sharex=False) # Don't share x-axis for different scales
+    # Don't share x-axis for different scales
+    fig, axes = plt.subplots(3, 1, figsize=(10, 12), sharex=False)
 
     plot_params = {
         'fill': True,
-        'common_norm': False, # Normalize each density independently
+        'common_norm': False,  # Normalize each density independently
         'alpha': 0.5
     }
 
     # Hue KDE
-    sns.kdeplot(data=color_df, x='Hue (degrees)', hue='label', ax=axes[0], **plot_params)
+    sns.kdeplot(data=color_df, x='Hue (degrees)',
+                hue='label', ax=axes[0], **plot_params)
     axes[0].set_title('Most Dominant Color Hue Distribution')
     axes[0].set_xlim(0, 360)
     axes[0].set_xlabel('Hue (degrees)')
 
     # Saturation KDE
-    sns.kdeplot(data=color_df, x='Saturation', hue='label', ax=axes[1], **plot_params)
+    sns.kdeplot(data=color_df, x='Saturation',
+                hue='label', ax=axes[1], **plot_params)
     axes[1].set_title('Most Dominant Color Saturation Distribution')
     axes[1].set_xlim(0, 1)
     axes[1].set_xlabel('Saturation')
 
     # Value KDE
-    sns.kdeplot(data=color_df, x='Value', hue='label', ax=axes[2], **plot_params)
+    sns.kdeplot(data=color_df, x='Value', hue='label',
+                ax=axes[2], **plot_params)
     axes[2].set_title('Most Dominant Color Value (Brightness) Distribution')
     axes[2].set_xlim(0, 1)
     axes[2].set_xlabel('Value')
@@ -421,7 +600,7 @@ def visualize_dominant_color_distribution(results, output_dir="."):
         handles, current_labels = ax.get_legend_handles_labels()
         if handles:
             ax.legend(title='Label')
-        else: # Remove empty legend boxes
+        else:  # Remove empty legend boxes
             ax.legend_ = None
 
     plt.tight_layout()
@@ -433,8 +612,18 @@ def visualize_dominant_color_distribution(results, output_dir="."):
 def visualize_dimensionality_reduction(results, method='umap', output_dir="."):
     """Performs t-SNE or UMAP and visualizes the results."""
     print(f"\n--- Dimensionality Reduction ({method.upper()}) ---")
-    deep_features = np.array([r['deep_features'] for r in results])
-    labels = [r['label'] for r in results]
+
+    # Filter results to only include those with successful deep features
+    results_with_features = [
+        r for r in results if r.get('deep_features') is not None]
+    if not results_with_features:
+        print("No deep features found for dimensionality reduction.")
+        return None, None
+
+    deep_features = np.array([r['deep_features']
+                             for r in results_with_features])
+    # Use labels corresponding to filtered results
+    labels = [r['label'] for r in results_with_features]
 
     if deep_features.ndim != 2 or deep_features.shape[0] < 2:
         print("Not enough data or invalid feature shape for dimensionality reduction.")
@@ -483,14 +672,19 @@ def visualize_dimensionality_reduction(results, method='umap', output_dir="."):
     print(f"Saved {method.upper()} visualization to {output_dir}")
     plt.close()
 
-    return embedding, labels  # Return embedding for clustering
+    # Return embedding and the filtered results list (for clustering)
+    return embedding, results_with_features
 
 
-def visualize_clustering(embedding, labels, results, n_clusters, output_dir="."):
+def visualize_clustering(embedding, results_with_features, n_clusters, output_dir="."):
     """Performs KMeans clustering on the reduced embedding and visualizes."""
-    if embedding is None or labels is None or embedding.shape[0] < n_clusters:
-        print("Skipping clustering: Invalid embedding or not enough samples.")
+    # Ensure results_with_features is used here, which matches the embedding
+    if embedding is None or not results_with_features or embedding.shape[0] < n_clusters:
+        print("Skipping clustering: Invalid embedding or not enough samples with features.")
         return
+
+    # Extract labels corresponding to the embedding
+    labels = [r['label'] for r in results_with_features]
 
     print(f"\n--- Clustering (KMeans, k={n_clusters}) ---")
     kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
@@ -514,6 +708,7 @@ def visualize_clustering(embedding, labels, results, n_clusters, output_dir=".")
     print("\nCluster Composition (Label Distribution):")
     for i in range(n_clusters):
         cluster_indices = np.where(cluster_labels == i)[0]
+        # Use labels from the filtered list
         cluster_actual_labels = [labels[idx] for idx in cluster_indices]
         if not cluster_actual_labels:
             continue
@@ -530,8 +725,11 @@ def visualize_clustering(embedding, labels, results, n_clusters, output_dir=".")
 
         # Select a few random images from the cluster
         n_rep_samples = min(5, len(cluster_indices))
-        sample_indices = random.sample(list(cluster_indices), n_rep_samples)
-        sample_results = [results[idx] for idx in sample_indices]
+        sample_indices_in_cluster = random.sample(
+            list(cluster_indices), n_rep_samples)
+        # Map back to the original indices in results_with_features
+        sample_results = [results_with_features[idx]
+                          for idx in sample_indices_in_cluster]
 
         fig, axes = plt.subplots(
             1, n_rep_samples, figsize=(n_rep_samples * 3, 3))
@@ -559,14 +757,98 @@ def visualize_clustering(embedding, labels, results, n_clusters, output_dir=".")
         plt.close(fig)
 
 
+# --- NEW VISUALIZATION FUNCTION ---
+def visualize_predicted_classes(results, top_n=TOP_N_CLASSES_TO_SHOW, output_dir="."):
+    """Analyzes and visualizes the distribution of predicted ImageNet classes."""
+    print(f"\n--- Predicted Class Analysis (Top {top_n}) ---")
+
+    # Filter results for those with valid predictions
+    pred_results = [r for r in results if r.get(
+        'predicted_class_name') is not None]
+    if not pred_results:
+        print("No valid prediction results found to visualize.")
+        return
+
+    # Create DataFrame
+    pred_df = pd.DataFrame([{
+        'label': r['label'],
+        'predicted_class_name': r['predicted_class_name'],
+        'prediction_confidence': r['prediction_confidence']
+    } for r in pred_results])
+
+    labels = sorted(pred_df['label'].unique())
+    num_labels = len(labels)
+
+    # --- Plot 1: Top N Predicted Classes per Label ---
+    fig, axes = plt.subplots(1, num_labels, figsize=(
+        7 * num_labels, 8), sharey=False)  # Increased height
+    if num_labels == 1:
+        axes = [axes]  # Ensure axes is iterable
+
+    print("\nTop Predicted Classes per Label:")
+    for i, label in enumerate(labels):
+        label_df = pred_df[pred_df['label'] == label]
+        class_counts = label_df['predicted_class_name'].value_counts()
+        top_classes = class_counts.head(top_n)
+
+        print(f"  Label '{label}' (Top {min(top_n, len(top_classes))}):")
+        for class_name, count in top_classes.items():
+            print(f"    - {class_name}: {count}")
+
+        if top_classes.empty:
+            axes[i].text(0.5, 0.5, "No prediction data", horizontalalignment='center',
+                         verticalalignment='center', transform=axes[i].transAxes)
+            axes[i].set_title(f"Top {top_n} Predicted Classes - {label}")
+            axes[i].set_xticks([])
+            axes[i].set_yticks([])
+        else:
+            sns.barplot(x=top_classes.values, y=top_classes.index,
+                        ax=axes[i], palette="viridis", orient='h')
+            axes[i].set_title(f"Top {top_n} Predicted Classes - {label}")
+            axes[i].set_xlabel("Count")
+            axes[i].set_ylabel("Predicted ImageNet Class")
+            # Adjust label size if names are long
+            axes[i].tick_params(axis='y', labelsize=8)
+
+    plt.suptitle("Most Frequent Predicted ImageNet Classes by Label", y=1.02)
+    # Adjust layout to prevent title overlap
+    plt.tight_layout(rect=[0, 0.03, 1, 0.98])
+    plt.savefig(os.path.join(
+        output_dir, "predicted_classes_top_n_barplot.png"))
+    print(f"Saved top predicted classes bar plot to {output_dir}")
+    plt.close(fig)
+
+    # --- Plot 2: Prediction Confidence Distribution ---
+    fig, ax = plt.subplots(figsize=(10, 6))
+    sns.histplot(data=pred_df, x='prediction_confidence',
+                 hue='label', kde=True, ax=ax, bins=30)
+    ax.set_title("Distribution of Prediction Confidence by Label")
+    ax.set_xlabel("Prediction Confidence")
+    ax.set_ylabel("Count")
+    ax.legend(title='Label')
+    plt.tight_layout()
+    plt.savefig(os.path.join(
+        output_dir, "prediction_confidence_distribution.png"))
+    print(f"Saved prediction confidence distribution plot to {output_dir}")
+    plt.close(fig)
+
+
 # --- Main Execution ---
 if __name__ == "__main__":
+    # Set the start method to 'spawn' to avoid potential deadlocks on Linux
+    # Needs to be done early, within the main block
+    try:
+        multiprocessing.set_start_method('spawn', force=True)
+        print("Set multiprocessing start method to 'spawn'.")
+    except RuntimeError:
+        # Might already be set or not applicable in some environments
+        print("Could not set multiprocessing start method (might be already set).")
+        pass
+
     print("--- Starting Image Analysis for Fake News Detection ---")
 
-    # Construct cache filename based on limit
-    limit_str = "all" if NUM_SAMPLES_TO_PROCESS is None else str(
-        NUM_SAMPLES_TO_PROCESS)
-    cache_filename = f"analysis_results_{limit_str}.pkl"
+    # --- UPDATE CACHE FILENAME ---
+    cache_filename = f"analysis_results_{limit_str}_v3.pkl"  # Changed to v3
     cache_filepath = os.path.join(RESULTS_CACHE_DIR, cache_filename)
 
     # 1. Load Data Paths and Labels
@@ -591,24 +873,29 @@ if __name__ == "__main__":
             with open(cache_filepath, 'rb') as f:
                 analysis_results = pickle.load(f)
             print(
-                f"Successfully loaded cached results for {limit_str} samples.")
+                # Updated format string
+                f"Successfully loaded cached results for {limit_str} samples (v3 format).")
         except Exception as e:
             print(f"Error loading cached results: {e}. Recomputing...")
             analysis_results = None  # Ensure recomputation if loading fails
 
     if analysis_results is None:
-        # 2. Setup Feature Extractor (only if needed)
-        print("\n--- 2. Setting up Feature Extractor ---")
+        # 2. Setup Feature Extractor & Classifier
+        print("\n--- 2. Setting up Models (Feature Extractor & Classifier) ---")
         try:
-            feature_extractor, preprocess, device = setup_feature_extractor()
+            # Update to get classifier model and class names
+            feature_extractor, classifier_model, preprocess, device, imagenet_class_names = setup_feature_extractor()
         except Exception as e:
-            print(f"Error setting up feature extractor: {e}")
+            print(f"Error setting up models: {e}")
             exit()
 
-        # 3. Perform Analysis (Feature Extraction)
-        print("\n--- 3. Analyzing Images ---")
+        # 3. Perform Analysis (Feature Extraction, Classification - now optimized)
+        print("\n--- 3. Analyzing Images (Optimized) ---")
         analysis_results = analyze_images(
-            loader, feature_extractor, preprocess, device, limit=NUM_SAMPLES_TO_PROCESS)
+            loader, feature_extractor, classifier_model, preprocess, device, imagenet_class_names,  # Pass new args
+            limit=NUM_SAMPLES_TO_PROCESS,
+            batch_size=DEEP_FEATURE_BATCH_SIZE,
+            num_workers=NUM_PARALLEL_WORKERS)
 
         # Save results if analysis was successful
         if analysis_results:
@@ -616,7 +903,8 @@ if __name__ == "__main__":
             try:
                 with open(cache_filepath, 'wb') as f:
                     pickle.dump(analysis_results, f)
-                print("Successfully saved results.")
+                # Updated format string
+                print("Successfully saved results (v3 format).")
             except Exception as e:
                 print(f"Error saving results to cache: {e}")
 
@@ -636,19 +924,27 @@ if __name__ == "__main__":
         visualize_dominant_colors(
             analysis_results, n_samples=3, output_dir=OUTPUT_DIR)
 
-        # 4.3.1 Dominant Color Distribution (New)
+        # 4.3.1 Dominant Color Distribution
         visualize_dominant_color_distribution(
-             analysis_results, output_dir=OUTPUT_DIR)
+            analysis_results, output_dir=OUTPUT_DIR)
 
-        # 4.4 Dimensionality Reduction
+        # 4.4 NEW: Visualize Predicted Classes
+        visualize_predicted_classes(
+            analysis_results, top_n=TOP_N_CLASSES_TO_SHOW, output_dir=OUTPUT_DIR)
+
+        # 4.5 Dimensionality Reduction
+        print("\n--- 4.5 Dimensionality Reduction ---")  # Renumbered title
         reduction_method = 'umap' if HAS_UMAP else 'tsne'
-        embedding, labels_for_clustering = visualize_dimensionality_reduction(
+        # Pass the full results, filtering happens inside the function
+        embedding, results_with_features = visualize_dimensionality_reduction(
             analysis_results, method=reduction_method, output_dir=OUTPUT_DIR)
 
-        # 4.5 Clustering (based on dimensionality reduction result)
-        if embedding is not None:
-            visualize_clustering(embedding, labels_for_clustering,
-                                 analysis_results, n_clusters=CLUSTER_N, output_dir=OUTPUT_DIR)
+        # 4.6 Clustering (based on dimensionality reduction result)
+        print("\n--- 4.6 Clustering ---")  # Renumbered title
+        # Pass the filtered results_with_features obtained from reduction
+        if embedding is not None and results_with_features:
+            visualize_clustering(embedding, results_with_features,
+                                 n_clusters=CLUSTER_N, output_dir=OUTPUT_DIR)
         else:
             print(
                 "\nSkipping clustering because dimensionality reduction failed or produced no results.")
