@@ -33,13 +33,13 @@ from concurrent.futures import ProcessPoolExecutor
 
 from data_loader import PostDataLoader, DirectoryDataLoader
 
-# --- Configuration ---
+# # --- Configuration ---
 # POSTS_FILES = ['data/twitter_dataset/devset/posts.txt', 'data/twitter_dataset/testset/posts_groundtruth.txt'] # Add more paths here if needed
 # IMAGES_DIRS = ['data/twitter_dataset/devset/images', 'data/twitter_dataset/testset/images'] # Add corresponding image dirs here
 # DATA_LOADER = PostDataLoader
-# DATA_LOADER_ARGS = [POSTS_FILE, IMAGES_DIRS]
-# OUTPUT_DIR_BASE = 'analysis_output'  # Directory to save plots
-# RESULTS_CACHE_DIR = 'analysis_cache'  # Directory for cached results
+# DATA_LOADER_ARGS = [POSTS_FILES, IMAGES_DIRS]
+# OUTPUT_DIR_BASE = 'analysis_output_twitter'  # Directory to save plots
+# RESULTS_CACHE_DIR = 'analysis_cache_twitter'  # Directory for cached results
 
 RUMOR_DIRS = ['/mnt/d/LFDev-D/weibo_dataset/rumor_images']
 NONRUMOR_DIRS = ['/mnt/d/LFDev-D/weibo_dataset/nonrumor_images']
@@ -222,6 +222,8 @@ def get_descriptive_label(label):
     label_map = {
         'rumor': 'Rumor (Fake)',
         'nonrumor': 'Non-Rumor (Real)',
+        'real': 'Non-Rumor (Real)',
+        'fake': 'Rumor (Fake)'
         # Add any other labels if they exist
     }
     return label_map.get(label, label)  # Return original if not in map
@@ -945,6 +947,116 @@ def visualize_predicted_classes(results, top_n=TOP_N_CLASSES_TO_SHOW, output_dir
     plt.close(fig)
 
 
+def visualize_label_skew_per_predicted_class(results, min_samples_per_class=10, top_n_skewed=20, output_dir="."):
+    """
+    Analyzes and visualizes the predicted ImageNet classes with the most skewed 
+    distribution of 'Rumor (Fake)' vs 'Non-Rumor (Real)' labels compared to the overall dataset.
+    """
+    print(f"\n--- Label Skew Analysis per Predicted Class (Top {top_n_skewed}) ---")
+
+    # Filter results for those with valid predictions
+    pred_results = [r for r in results if r.get('predicted_class_name') is not None]
+    if not pred_results:
+        print("No valid prediction results found for skew analysis.")
+        return
+
+    # Create DataFrame with descriptive labels
+    pred_df = pd.DataFrame([{
+        'label': get_descriptive_label(r['label']),  # Use descriptive label
+        'predicted_class_name': r['predicted_class_name'],
+    } for r in pred_results])
+
+    if pred_df.empty:
+        print("Prediction DataFrame is empty after filtering.")
+        return
+
+    # --- Calculate Overall Label Distribution ---
+    overall_label_counts = pred_df['label'].value_counts()
+
+    # overall_label_counts = {
+    #     'Rumor (Fake)': overall_label_counts_rf['fake'], 'Non-Rumor (Real)': overall_label_counts_rf['real']}
+    total_samples = len(pred_df)
+    overall_proportions = overall_label_counts / total_samples
+    overall_rumor_prop = overall_proportions.get('Rumor (Fake)', 0)
+    print(f"Overall Label Distribution: {dict(overall_label_counts)}")
+    print(f"Overall 'Rumor (Fake)' Proportion: {overall_rumor_prop:.3f}")
+
+
+    # --- Calculate Label Distribution and Skewness per Predicted Class ---
+    class_stats = []
+    grouped = pred_df.groupby('predicted_class_name')
+
+    for name, group in grouped:
+        n_samples = len(group)
+        if n_samples < min_samples_per_class:
+            continue # Skip classes with too few samples
+
+        label_counts = group['label'].value_counts()
+        # Calculate proportions within the class
+        rumor_count = label_counts.get('Rumor (Fake)', 0)
+        nonrumor_count = label_counts.get('Non-Rumor (Real)', 0)
+        class_rumor_prop = rumor_count / n_samples
+
+        # Calculate skewness (absolute difference from overall proportion)
+        skewness = abs(class_rumor_prop - overall_rumor_prop)
+
+        class_stats.append({
+            'predicted_class_name': name,
+            'n_samples': n_samples,
+            'rumor_prop': class_rumor_prop,
+            'nonrumor_prop': nonrumor_count / n_samples,
+            'skewness': skewness
+        })
+
+    if not class_stats:
+        print(f"No predicted classes found with at least {min_samples_per_class} samples.")
+        return
+
+    # --- Identify Top Skewed Classes ---
+    skew_df = pd.DataFrame(class_stats)
+    top_skewed_df = skew_df.nlargest(top_n_skewed, 'skewness')
+
+    if top_skewed_df.empty:
+        print("No skewed classes identified after filtering and sorting.")
+        return
+
+    print(f"\nTop {len(top_skewed_df)} Predicted Classes with Highest Label Skew:")
+    # Sort for plotting - maybe sort by rumor_prop to group visually?
+    top_skewed_df = top_skewed_df.sort_values(by='rumor_prop', ascending=False)
+
+    # --- Create Stacked Bar Plot ---
+    fig, ax = plt.subplots(figsize=(10, max(8, len(top_skewed_df) * 0.4))) # Adjust height based on N
+
+    # Prepare data for stacked bar plot
+    plot_data = top_skewed_df.set_index('predicted_class_name')[['rumor_prop', 'nonrumor_prop']]
+    # Rename columns for legend
+    plot_data.columns = ['Rumor (Fake) Proportion', 'Non-Rumor (Real) Proportion']
+
+    plot_data.plot(kind='barh', stacked=True, ax=ax, colormap='coolwarm_r') # Use reversed coolwarm
+
+    # Add overall proportion line
+    ax.axvline(x=overall_rumor_prop, color='black', linestyle='--', linewidth=1.5,
+               label=f'Overall Fake Prop ({overall_rumor_prop:.2f})')
+
+    ax.set_title(f'Top {len(top_skewed_df)} Predicted Classes with Most Skewed Label Distribution')
+    ax.set_xlabel('Proportion within Predicted Class')
+    ax.set_ylabel('Predicted ImageNet Class')
+    ax.set_xlim(0, 1) # Proportions are between 0 and 1
+    ax.legend(title='Label Type', bbox_to_anchor=(1.05, 1), loc='upper left') # Place legend outside
+    ax.tick_params(axis='y', labelsize=8) # Adjust label size if needed
+
+    # Add text labels for total samples per class
+    for i, (idx, row) in enumerate(top_skewed_df.iterrows()):
+        # Position text slightly to the right of the bar
+        ax.text(1.01, i, f"n={row['n_samples']}", va='center', fontsize=7)
+
+
+    plt.tight_layout(rect=[0, 0, 0.85, 1]) # Adjust layout to make space for legend and text
+    plt.savefig(os.path.join(output_dir, "predicted_classes_label_skew.png"))
+    print(f"Saved label skew per predicted class plot to {output_dir}")
+    plt.close(fig)
+
+
 # --- Main Execution ---
 if __name__ == "__main__":
     # Set the start method to 'spawn' to avoid potential deadlocks on Linux
@@ -1052,8 +1164,12 @@ if __name__ == "__main__":
         embedding, results_with_features = visualize_dimensionality_reduction(
             analysis_results, method=reduction_method, output_dir=OUTPUT_DIR)
 
-        # 4.6 Clustering (based on dimensionality reduction result)
-        print("\n--- 4.6 Clustering ---")  # Renumbered title
+        # 4.6 NEW: Visualize Label Skew per Predicted Class
+        visualize_label_skew_per_predicted_class(
+            analysis_results, min_samples_per_class=10, top_n_skewed=20, output_dir=OUTPUT_DIR)
+
+        # 4.7 Clustering (based on dimensionality reduction result)
+        print("\n--- 4.7 Clustering ---")  # Renumbered title (was 4.6)
         # Pass the filtered results_with_features obtained from reduction
         if embedding is not None and results_with_features:
             visualize_clustering(embedding, results_with_features,
