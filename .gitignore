@@ -1,0 +1,15 @@
+temp
+data
+analysis_output
+analysis_cache
+
+.vscode
+.DS_Store
+
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+*.pyz
+*.pywz
+*.pyzw
