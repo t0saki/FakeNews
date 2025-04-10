@@ -1,7 +1,7 @@
 temp
 data
 analysis_output*
-analysis_cache
+analysis_cache*
 
 .vscode
 .DS_Store

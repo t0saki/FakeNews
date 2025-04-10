@@ -34,8 +34,8 @@ from concurrent.futures import ProcessPoolExecutor
 from data_loader import PostDataLoader
 
 # --- Configuration ---
-POSTS_FILE_PATH = ['data/twitter_dataset/devset/posts.txt']
-IMAGES_DIR_PATH = ['data/twitter_dataset/devset/images']
+POSTS_FILE_PATH = ['data/twitter_dataset/devset/posts.txt', 'data/twitter_dataset/testset/posts_groundtruth.txt'] # Add more paths here if needed
+IMAGES_DIR_PATH = ['data/twitter_dataset/devset/images', 'data/twitter_dataset/testset/images'] # Add corresponding image dirs here
 OUTPUT_DIR_BASE = 'analysis_output'  # Directory to save plots
 RESULTS_CACHE_DIR = 'analysis_cache'  # Directory for cached results
 # Limit processing for faster demo, set to None for all
