@@ -477,7 +477,7 @@ def visualize_feature_distributions(results, output_dir="."):
 
     # Convert list of dicts to DataFrame
     plot_df = pd.DataFrame(plot_data_list)
-    
+
     # Set reasonable plotting limits for each feature
     plot_limits = {
         'width': (0, min(3000, plot_df['width'].quantile(0.98))),  # Cap at 3000 or 98th percentile
@@ -508,20 +508,29 @@ def visualize_feature_distributions(results, output_dir="."):
         # Histogram / Density Plot using the DataFrame
         # Use stat='density' for normalization
         sns.histplot(data=valid_df, x=feature,
-                     hue='label', kde=True, ax=axes[i, 0], stat='density', common_norm=False)
+                     hue='label', kde=True, ax=axes[i, 0], stat='density', common_norm=False,
+                     palette='tab10', legend=True) # Ensure legend=True here
         axes[i, 0].set_title(f"Density Plot of {feature.capitalize()}")
         axes[i, 0].set_xlabel(f"{feature.capitalize()} Value")
         axes[i, 0].set_ylabel("Density") # Changed from Frequency
-        # Ensure legend is present
-        handles, current_labels = axes[i, 0].get_legend_handles_labels()
-        if handles: # Only add legend if there's something to show
-             axes[i, 0].legend(title='Class Label')
+
+        # --- Updated Legend Handling ---
+        # Check if a legend was automatically created by seaborn
+        current_legend = axes[i, 0].get_legend()
+        if current_legend:
+            current_legend.set_title('Class Label') # Set title on existing legend
         else:
-             axes[i, 0].legend_ = None # Remove empty legend box
+            # If seaborn didn't create one (e.g., only one hue value), try creating manually if possible
+            handles, labels = axes[i, 0].get_legend_handles_labels()
+            if handles:
+                 axes[i, 0].legend(handles=handles, labels=labels, title='Class Label')
+            # If still no handles, no legend is needed/possible
+        # --- End Updated Legend Handling ---
+
 
         # Set x-axis limits for histogram/density plot
         axes[i, 0].set_xlim(plot_limits[feature])
-        
+
         # For aspect ratio, add reference lines for common aspect ratios
         if feature == 'aspect_ratio':
             common_ratios = {
@@ -534,18 +543,19 @@ def visualize_feature_distributions(results, output_dir="."):
             for label, ratio in common_ratios.items():
                 if ratio >= plot_limits[feature][0] and ratio <= plot_limits[feature][1]:
                     axes[i, 0].axvline(x=ratio, color='red', linestyle='--', alpha=0.7)
-                    axes[i, 0].text(ratio, axes[i, 0].get_ylim()[1]*0.9, label, 
+                    axes[i, 0].text(ratio, axes[i, 0].get_ylim()[1]*0.9, label,
                                     rotation=90, verticalalignment='top', fontsize=8)
 
         # Box Plot using the DataFrame
         # Pass the DataFrame directly and specify x, y, and order
         sns.boxplot(data=valid_df, x='label', y=feature,
                     # Use unique_labels for order
-                    ax=axes[i, 1], order=unique_labels)
+                    ax=axes[i, 1], order=unique_labels,
+                    palette='tab10')
         axes[i, 1].set_title(f"Box Plot of {feature.capitalize()}")
         axes[i, 1].set_xlabel("Class Label")
         axes[i, 1].set_ylabel(f"{feature.capitalize()} Value")
-        
+
         # Set y-axis limits for boxplot
         axes[i, 1].set_ylim(plot_limits[feature])
 
@@ -616,20 +626,26 @@ def visualize_dominant_color_distribution(results, output_dir="."):
         'label': labels
     })
 
-    # Plot 1: Hue vs Saturation Scatter Plot
+    # Plot 1: Hue vs Value Scatter Plot
     plt.figure(figsize=(10, 8))
-    sns.scatterplot(data=color_df, x='Hue (degrees)', y='Saturation', hue='label',
+    scatter = sns.scatterplot(data=color_df, x='Hue (degrees)', y='Value', hue='label',
                     alpha=0.6, s=30, edgecolor=None)  # Removed edgecolor for clarity
-    plt.title('Most Dominant Color Distribution (Hue vs Saturation)')
+    plt.title('Most Dominant Color Distribution (Hue vs Value)')
     plt.xlabel('Hue (degrees)')
-    plt.ylabel('Saturation (0-1)')
+    plt.ylabel('Value')
     plt.xlim(0, 360)
     plt.ylim(0, 1)
-    plt.legend(title='Class Label')
-    plt.grid(True, linestyle='--', alpha=0.5)
-    plt.savefig(os.path.join(output_dir, "dominant_color_hsv_scatter.png"))
+    # Ensure legend exists before setting title
+    current_legend = plt.gca().get_legend()
+    if current_legend:
+        current_legend.set_title('Class Label')
+        # Move legend outside plot area if desired
+        plt.legend(title='Class Label', bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.tight_layout(rect=[0, 0, 0.85, 1]) # Adjust layout if legend is outside
+    plt.savefig(os.path.join(output_dir, "dominant_color_hsv_scatter.png")) # Save scatter separately
     print(f"Saved dominant color HSV scatter plot to {output_dir}")
-    plt.close()
+    plt.close() # Close scatter plot figure
+
 
     # Plot 2: KDE plots for H, S, V
     # Don't share x-axis for different scales
@@ -638,50 +654,36 @@ def visualize_dominant_color_distribution(results, output_dir="."):
     plot_params = {
         'fill': True,
         'common_norm': False,  # Normalize each density independently - Correct for comparing shapes
-        'alpha': 0.5
+        'alpha': 0.5,
+        'legend': True # Explicitly request legend from seaborn
     }
 
-    # Hue KDE
-    sns.kdeplot(data=color_df, x='Hue (degrees)',
-                hue='label', ax=axes[0], **plot_params)
-    axes[0].set_title('Most Dominant Color Hue Distribution')
-    axes[0].set_xlim(0, 360)
-    axes[0].set_xlabel('Hue (degrees)')
-    axes[0].set_ylabel('Density')
-    # Explicitly add legend if needed (hue usually does it)
-    handles, current_labels = axes[0].get_legend_handles_labels()
-    if handles:
-        axes[0].legend(title='Class Label')
-    else:
-        axes[0].legend_ = None
+    # --- Updated Legend Handling for KDE plots ---
+    plot_vars = ['Hue (degrees)', 'Saturation', 'Value']
+    plot_titles = ['Most Dominant Color Hue Distribution',
+                   'Most Dominant Color Saturation Distribution',
+                   'Most Dominant Color Value (Brightness) Distribution']
+    plot_xlims = [(0, 360), (0, 1), (0, 1)]
 
-    # Saturation KDE
-    sns.kdeplot(data=color_df, x='Saturation',
-                hue='label', ax=axes[1], **plot_params)
-    axes[1].set_title('Most Dominant Color Saturation Distribution')
-    axes[1].set_xlim(0, 1)
-    axes[1].set_xlabel('Saturation (0-1)')
-    axes[1].set_ylabel('Density')
-    # Explicitly add legend if needed
-    handles, current_labels = axes[1].get_legend_handles_labels()
-    if handles:
-        axes[1].legend(title='Class Label')
-    else:
-        axes[1].legend_ = None
+    for i, var in enumerate(plot_vars):
+        sns.kdeplot(data=color_df, x=var, hue='label', ax=axes[i], **plot_params)
+        axes[i].set_title(plot_titles[i])
+        axes[i].set_xlim(plot_xlims[i])
+        axes[i].set_xlabel(var)
+        axes[i].set_ylabel('Density')
 
-    # Value KDE
-    sns.kdeplot(data=color_df, x='Value', hue='label',
-                ax=axes[2], **plot_params)
-    axes[2].set_title('Most Dominant Color Value (Brightness) Distribution')
-    axes[2].set_xlim(0, 1)
-    axes[2].set_xlabel('Value (0-1)')
-    axes[2].set_ylabel('Density')
-    # Explicitly add legend if needed
-    handles, current_labels = axes[2].get_legend_handles_labels()
-    if handles:
-        axes[2].legend(title='Class Label')
-    else:
-        axes[2].legend_ = None
+        # Check if a legend was automatically created and set its title
+        current_legend = axes[i].get_legend()
+        if current_legend:
+            current_legend.set_title('Class Label')
+        else:
+             # If seaborn didn't create one (e.g., only one hue value), try creating manually if possible
+            handles, labels = axes[i].get_legend_handles_labels()
+            if handles:
+                 axes[i].legend(handles=handles, labels=labels, title='Class Label')
+            # Otherwise, no legend is needed
+
+    # --- End Updated Legend Handling ---
 
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, "dominant_color_hsv_kde.png"))
@@ -743,7 +745,7 @@ def visualize_dimensionality_reduction(results, method='umap', output_dir="."):
 
     # Plotting
     plt.figure(figsize=(10, 8))
-    sns.scatterplot(x=embedding[:, 0], y=embedding[:, 1],
+    scatter = sns.scatterplot(x=embedding[:, 0], y=embedding[:, 1],
                     hue=descriptive_labels, alpha=0.7, s=50)  # Increased point size
     plt.title(f'{method.upper()} Visualization of Image Features')
     plt.xlabel(f'{method.upper()} Component 1')
@@ -929,16 +931,24 @@ def visualize_predicted_classes(results, top_n=TOP_N_CLASSES_TO_SHOW, output_dir
     fig, ax = plt.subplots(figsize=(10, 6))
     # Use stat='density' for normalization
     sns.histplot(data=pred_df, x='prediction_confidence',
-                 hue='label', kde=True, ax=ax, bins=30, stat='density', common_norm=False)
+                 hue='label', kde=True, ax=ax, bins=30, stat='density', common_norm=False, legend=True) # Ensure legend=True
     ax.set_title("Density Distribution of Prediction Confidence by Class")
     ax.set_xlabel("Prediction Confidence (0-1)")
     ax.set_ylabel("Density") # Changed from Count
-    # Ensure legend is present
-    handles, current_labels = ax.get_legend_handles_labels()
-    if handles:
-        ax.legend(title='Class Label')
+
+    # --- Updated Legend Handling ---
+    # Check if a legend was automatically created by seaborn and set its title
+    current_legend = ax.get_legend()
+    if current_legend:
+        current_legend.set_title('Class Label')
     else:
-        ax.legend_ = None
+        # If seaborn didn't create one, try creating manually if possible
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+             ax.legend(handles=handles, labels=labels, title='Class Label')
+        # Otherwise, no legend is needed
+    # --- End Updated Legend Handling ---
+
 
     plt.tight_layout()
     plt.savefig(os.path.join(
@@ -949,10 +959,10 @@ def visualize_predicted_classes(results, top_n=TOP_N_CLASSES_TO_SHOW, output_dir
 
 def visualize_label_skew_per_predicted_class(results, min_samples_per_class=10, top_n_skewed=20, output_dir="."):
     """
-    Analyzes and visualizes the predicted ImageNet classes with the most skewed 
-    distribution of 'Rumor (Fake)' vs 'Non-Rumor (Real)' labels compared to the overall dataset.
+    Analyzes and visualizes the predicted ImageNet classes with the most skewed
+    distribution of 'Rumor (Fake)' vs 'Non-Rumor (Real)' labels, weighted by sample size.
     """
-    print(f"\n--- Label Skew Analysis per Predicted Class (Top {top_n_skewed}) ---")
+    print(f"\n--- Label Skew Analysis per Predicted Class (Top {top_n_skewed}, Weighted) ---")
 
     # Filter results for those with valid predictions
     pred_results = [r for r in results if r.get('predicted_class_name') is not None]
@@ -982,7 +992,7 @@ def visualize_label_skew_per_predicted_class(results, min_samples_per_class=10, 
     print(f"Overall 'Rumor (Fake)' Proportion: {overall_rumor_prop:.3f}")
 
 
-    # --- Calculate Label Distribution and Skewness per Predicted Class ---
+    # --- Calculate Label Distribution and Weighted Skew Score per Predicted Class ---
     class_stats = []
     grouped = pred_df.groupby('predicted_class_name')
 
@@ -997,30 +1007,34 @@ def visualize_label_skew_per_predicted_class(results, min_samples_per_class=10, 
         nonrumor_count = label_counts.get('Non-Rumor (Real)', 0)
         class_rumor_prop = rumor_count / n_samples
 
-        # Calculate skewness (absolute difference from overall proportion)
-        skewness = abs(class_rumor_prop - overall_rumor_prop)
+        # Calculate weighted skew score
+        abs_diff = abs(class_rumor_prop - overall_rumor_prop)
+        # Weight by sqrt(n_samples)
+        score = abs_diff * math.sqrt(n_samples)
 
         class_stats.append({
             'predicted_class_name': name,
             'n_samples': n_samples,
             'rumor_prop': class_rumor_prop,
             'nonrumor_prop': nonrumor_count / n_samples,
-            'skewness': skewness
+            'score': score # Store the new score
         })
 
     if not class_stats:
         print(f"No predicted classes found with at least {min_samples_per_class} samples.")
         return
 
-    # --- Identify Top Skewed Classes ---
+    # --- Identify Top Skewed Classes based on Weighted Score ---
     skew_df = pd.DataFrame(class_stats)
-    top_skewed_df = skew_df.nlargest(top_n_skewed, 'skewness')
+    # Sort by the new 'score'
+    top_skewed_df = skew_df.nlargest(top_n_skewed, 'score')
 
     if top_skewed_df.empty:
         print("No skewed classes identified after filtering and sorting.")
         return
 
-    print(f"\nTop {len(top_skewed_df)} Predicted Classes with Highest Label Skew:")
+    # Updated print statement
+    print(f"\nTop {len(top_skewed_df)} Predicted Classes with Highest Weighted Label Skew:")
     # Sort for plotting - maybe sort by rumor_prop to group visually?
     top_skewed_df = top_skewed_df.sort_values(by='rumor_prop', ascending=False)
 
@@ -1038,22 +1052,27 @@ def visualize_label_skew_per_predicted_class(results, min_samples_per_class=10, 
     ax.axvline(x=overall_rumor_prop, color='black', linestyle='--', linewidth=1.5,
                label=f'Overall Fake Prop ({overall_rumor_prop:.2f})')
 
-    ax.set_title(f'Top {len(top_skewed_df)} Predicted Classes with Most Skewed Label Distribution')
+    # Updated plot title
+    ax.set_title(f'Top {len(top_skewed_df)} Predicted Classes with Most Skewed Label Distribution (Weighted by Sample Size)')
     ax.set_xlabel('Proportion within Predicted Class')
     ax.set_ylabel('Predicted ImageNet Class')
     ax.set_xlim(0, 1) # Proportions are between 0 and 1
-    ax.legend(title='Label Type', bbox_to_anchor=(1.05, 1), loc='upper left') # Place legend outside
+    ax.legend(title='Class Label', bbox_to_anchor=(1.05, 1), loc='upper left') # Place legend outside
     ax.tick_params(axis='y', labelsize=8) # Adjust label size if needed
 
     # Add text labels for total samples per class
-    for i, (idx, row) in enumerate(top_skewed_df.iterrows()):
-        # Position text slightly to the right of the bar
-        ax.text(1.01, i, f"n={row['n_samples']}", va='center', fontsize=7)
+    # Need to iterate using the sorted dataframe used for plotting
+    # Let's re-fetch the sorted indices or iterate directly on top_skewed_df
+    for i, class_name in enumerate(top_skewed_df['predicted_class_name']):
+        n_samples = top_skewed_df.loc[top_skewed_df['predicted_class_name'] == class_name, 'n_samples'].iloc[0]
+        # Position text slightly to the right of the bar, aligned with the horizontal bar index 'i'
+        ax.text(1.01, i, f"n={n_samples}", va='center', fontsize=7)
 
 
     plt.tight_layout(rect=[0, 0, 0.85, 1]) # Adjust layout to make space for legend and text
-    plt.savefig(os.path.join(output_dir, "predicted_classes_label_skew.png"))
-    print(f"Saved label skew per predicted class plot to {output_dir}")
+    # Updated filename slightly for clarity
+    plt.savefig(os.path.join(output_dir, "predicted_classes_label_skew_weighted.png"))
+    print(f"Saved weighted label skew per predicted class plot to {output_dir}")
     plt.close(fig)
 
 
